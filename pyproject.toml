@@ -1,0 +1,21 @@
+[project]
+name = "p1-llm-api"
+version = "0.1.0"
+description = "OpenAI 兼容的 LLM 对话 API 服务：/health 健康检查 + /chat 对话，FastAPI + DeepSeek，Swagger UI 静态资源本地化"
+authors = [
+    { name = "leijixu", email = "1497496617@qq.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.143.0",
+    "openai>=3.28.0",
+    "python-dotenv>=1.2.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+p1-llm-api = "p1_llm_api:main"
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"
