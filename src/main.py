@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Iterable
+from fastapi.responses import StreamingResponse
 
 load_dotenv()
 app = FastAPI(docs_url=None)
@@ -33,9 +35,23 @@ def health():
 @app.post("/chat")
 def chat(req: ChatRequest):
     user_input = req.message.strip()
-    reqs = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role":"user","content":user_input}],
         stream=False,
     )
-    return {"reply":reqs.choices[0].message.content}
+    return {"reply":resp.choices[0].message.content}
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest):
+    def event_stream() -> Iterable[str]:
+        stream = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": req.message.strip()}],
+            stream=True,
+        )
+        for chunk in stream:
+            piece = chunk.choices[0].delta.content
+            if piece:
+                yield f"data: {piece}\n\n"
+    return StreamingResponse(event_stream(),media_type="text/event-stream")
