@@ -1,6 +1,6 @@
 # LLM 对话 API 服务
 
-基于 FastAPI 的大模型对话接口服务。通过 OpenAI 兼容 SDK 接入 DeepSeek，提供健康检查、单轮对话与流式对话三个接口，并自带可直接调试的 Swagger 文档。
+基于 FastAPI 的大模型对话接口服务。通过 OpenAI 兼容 SDK 接入 DeepSeek，提供健康检查与三种对话接口（一次性返回 / 同步流式 / 异步流式），自带可直接调试的 Swagger 文档，并附带一份并发压测脚本，用实测数据对比同步与异步端点的行为差异。
 
 ## 接口
 
@@ -8,9 +8,12 @@
 | --- | --- | --- | --- | --- |
 | GET | `/health` | 健康检查 | 无 | `{"status": "ok"}` |
 | POST | `/chat` | 单轮对话（一次性返回） | `{"message": "你好"}` | `{"reply": "你好！..."}` |
-| POST | `/chat/stream` | 单轮对话（SSE 流式返回） | `{"message": "你好"}` | `text/event-stream`，逐块推送 `data: ...` |
+| POST | `/chat/stream` | 流式对话（同步实现） | `{"message": "你好"}` | `text/event-stream`，逐块推送 `data: ...` |
+| POST | `/chat/stream/async` | 流式对话（异步实现） | `{"message": "你好"}` | 同上 |
 
-启动后打开 http://127.0.0.1:8000/docs 可直接在页面上调用这三个接口。
+另外有两个**只用于压测对照**的端点：`/slow`（`async def` + `await asyncio.sleep(1.5)`）与 `/slow-sync`（`def` + `time.sleep(1.5)`），见「同步 vs 异步」一节。
+
+启动后打开 http://127.0.0.1:8000/docs 可直接在页面上调用这些接口。
 
 ## 快速开始
 
@@ -29,7 +32,7 @@
 3. 启动服务
 
    ```powershell
-   uv run uvicorn main:app --app-dir src --port 8000
+   uv run uvicorn main:app --app-dir src --port 8000 --reload
    ```
 
    `--app-dir src` 不能省：入口文件在 `src/` 下，而 uvicorn 默认只在当前目录里找模块。
@@ -46,6 +49,7 @@
 src/
   main.py        接口定义（FastAPI 应用）
   static/        Swagger UI 静态资源（本地化，见下文）
+bench.py         并发压测脚本（对比同步 / 异步端点）
 .env             密钥，已被 .gitignore 忽略
 pyproject.toml   依赖声明
 ```
@@ -89,19 +93,41 @@ data: 杭州
 data: 是浙江省的省会
 ```
 
-规则是 `data:` + **一个空格** + 内容，然后空行表示这一条消息结束。浏览器端用 `EventSource` 解析。注意冒号后面的空格是协议规定的分隔符，漏掉会导致内容解析错乱。
+规则是 `data:` + **一个空格** + 内容，然后空行表示这一条消息结束。浏览器端用 `EventSource` 解析。注意冒号后面的空格是协议规定的分隔符，漏掉会导致内容解析错乱；而 Content-Type 必须是严格的 `text/event-stream`，少了 `text/` 前缀时 Swagger 依然能正常显示响应体（它只是把字符串原样打出来，不解析 SSE），但真实前端会直接连接失败。
 
 FastAPI 侧用 `StreamingResponse` 包一个**生成器**：生成器 `yield` 一次，客户端就收到一个 chunk，响应头里是 `transfer-encoding: chunked`（长度未知，边算边发）。
 
-过程中踩到的三个坑：
+过程中踩到的坑：
 
-- **生成器里的代码是「请求来了才执行」**。函数体第一行的拼写错误（`comletions`）在启动时完全没有症状，只有真正调用接口才抛 `AttributeError`，表现为「启动正常、一调就断」，浏览器只能显示 `Failed to fetch`。排查方法是去看 uvicorn 终端里的 traceback，而不是在浏览器里找原因。
+- **生成器里的代码是「请求来了才执行」**。函数体里的拼写错误（`comletions`）在启动时完全没有症状，只有真正调用接口才抛 `AttributeError`，表现为「启动正常、一调就断」，浏览器只能显示 `Failed to fetch`。排查方法是去看 uvicorn 终端里的 traceback，而不是在浏览器里找原因。
 - **`StreamingResponse(content, status_code, headers, media_type, ...)`**：第二个位置参数是 `status_code`，不是 `media_type`。把 MIME 类型当第二个位置参数传进去，得到的是错误的状态码和默认的 `Content-Type`，必须写成关键字参数 `media_type="text/event-stream"`。
-- **`data:` 后必须有空格**，见上文协议格式。
+
+### 5. 同步 vs 异步：实测数据
+
+同一台机器、同一个 uvicorn 进程、同样的 1.5 秒等待，各发 60 个并发请求：
+
+| 端点 | 实现 | 60 并发总耗时 |
+| --- | --- | --- |
+| `/slow-sync` | `def` + `time.sleep(1.5)` | **3.19 s** |
+| `/slow` | `async def` + `await asyncio.sleep(1.5)` | **1.78 s** |
+
+同步版为什么是 3.19 秒而不是 1.5 秒？因为 FastAPI 把同步端点丢进 anyio 的线程池执行，而线程池的默认容量是 **40**（`anyio/_backends/_asyncio.py` 里的 `CapacityLimiter(40)`）。60 个请求要跑两批：40 + 20，所以约等于 1.5 × 2。
+
+异步版 1.78 秒 ≈ 1.5 秒的等待 + 约 0.28 秒的客户端开销（`urllib` 每个请求新建一条 TCP 连接）。60 个请求全部挂在同一个事件循环上，一起等、一起回。
+
+得出的结论：
+
+- **同步端点的并发上限 = 线程池容量（默认 40）**，超出的请求排队
+- **异步端点没有这个上限**，理论上限接近操作系统的文件描述符数量
+- 但异步有个前提：端点内部不能出现同步阻塞调用。一旦出现（比如在 `async def` 里调用同步的 SDK），整个事件循环会被卡住，并发度掉到 1，比同步版还差
+
+复现方式：把 `bench.py` 顶部的 `URL` 改成对应端点，然后 `uv run python bench.py`。
 
 ## 已知局限与下一步
 
-- `/chat` 与 `/chat/stream` 都是同步实现（`def` + 同步 `OpenAI` 客户端）。FastAPI 会把同步端点丢到线程池执行，不会阻塞事件循环，但每个进行中的请求都占住一个线程，高并发下线程池会成为瓶颈。**下一步：改用 `AsyncOpenAI` + `async def` + `async for`**，并加一个并发压测对比。
-- `/chat/stream` 没有发送 SSE 的结束事件（`data: [DONE]`）和异常事件，客户端无法区分「正常结束」和「中途断了」。
-- 两个对话接口每次请求都独立，没有多轮上下文（对比：P0 的命令行版本已实现多轮记忆）。
-- 尚无鉴权、限流与超时重试，不适合直接暴露到公网。
+- `/slow` 与 `/slow-sync` 是压测对照端点，不属于业务接口，上生产前应删除或独立成文件
+- 压测脚本用 `urllib`，每个请求新建 TCP 连接，客户端开销没有和端点开销分离；换成 `httpx.AsyncClient` 复用连接后能测得更准
+- 两个流式端点都没有发送 SSE 的结束事件（`data: [DONE]`）与异常事件，客户端无法区分「正常结束」和「中途断了」
+- 对话端点每次请求都独立，没有多轮上下文（对比：P0 的命令行版本已实现多轮记忆）
+- 尚无鉴权、限流与超时重试
+- 尚未 Docker 化，也未部署到云服务器
