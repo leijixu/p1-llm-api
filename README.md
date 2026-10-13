@@ -137,11 +137,44 @@ uv run python bench.py http://127.0.0.1:8000/slow 60
 uv run python bench.py http://127.0.0.1:8000/slow-sync 120
 uv run python bench.py http://127.0.0.1:8000/slow 120
 ```
+### 6. 超时与错误处理
+
+上游（模型服务）不是永远可用的。openai SDK 的默认超时是 **600 秒**（`openai/_constants.py` 里的 `DEFAULT_TIMEOUT`），意思是上游卡住时，一个请求会占着资源等满 10 分钟；并发一上来，服务自己先被拖死。所以三个对话端点都显式设了 `timeout=30.0`。
+
+> 流式接口里的 `timeout` 语义不一样：它不是「整个回答最多 30 秒」，而是「**两个 chunk 之间**最多等 30 秒」，长回答不会被掐断。
+
+出错时要翻译成正确的状态码，而不是笼统的 500：
+
+| 上游情况 | 异常类型 | 返回 | 含义 |
+| --- | --- | --- | --- |
+| 请求超时 | `APITimeoutError` | **504** | 网关等上游超时 |
+| 连不上 / 网络中断 | `APIConnectionError` | **502** | 网关连不上上游 |
+| 上游返回错误状态码 | `APIStatusError` | 待补 | 按具体状态细分 |
+| 触发限流 | `RateLimitError` | 待补 | 是 `APIStatusError` 的子类 |
+
+两个容易踩的点：
+
+- **`except` 的顺序必须子类在前**。`APITimeoutError` 继承自 `APIConnectionError`（见 `openai/_exceptions.py`），父类写前面会把超时也接走，永远返回不到 504
+- **流式端点不能靠状态码上报错误**。`StreamingResponse` 会先发 `200 OK` 响应头，然后才开始跑生成器；生成器抛错时状态码已经发出去了。唯一的上报通道是往流里再写一条消息：
+
+```
+event: upstream_error
+data: 模型服务超时，回答已中断
+```
+
+事件名用 `upstream_error` 而不是 `error`，是为了避开 `EventSource` 内置的 `error` 事件（连接断开时触发），否则前端分不清是上游挂了还是自己网断了。
+
+验证方式（不用等上游真的挂）：
+
+- 超时：把 `timeout` 临时改成 `0.001` → `/chat` 返回 504，流式端点在流里返回 `upstream_error` 事件
+- 连不上：把 `base_url` 临时改成 `http://127.0.0.1:9/v1` → `/chat` 返回 502
 ## 已知局限与下一步
 
+- 两个流式端点只上报了异常事件，还没有发送结束事件（`data: [DONE]`），客户端无法区分「正常结束」和「连接被掐断」
+- 只有超时与连接错误做了状态码映射，`APIStatusError`（上游返回错误状态码）与 `RateLimitError`（限流）还没有细分
+- 重试完全依赖 SDK 默认配置（`max_retries=2`，指数退避 + 抖动），没有按接口场景调整
 - `/slow` 与 `/slow-sync` 是压测对照端点，不属于业务接口，上生产前应删除或独立成文件
 - 压测脚本用 `urllib`，每个请求新建 TCP 连接，客户端开销没有和端点开销分离；换成 `httpx.AsyncClient` 复用连接后能测得更准
-- 两个流式端点都没有发送 SSE 的结束事件（`data: [DONE]`）与异常事件，客户端无法区分「正常结束」和「中途断了」
 - 对话端点每次请求都独立，没有多轮上下文（对比：P0 的命令行版本已实现多轮记忆）
-- 尚无鉴权、限流与超时重试
+- 尚无鉴权与限流，不适合直接暴露到公网
 - 尚未 Docker 化，也未部署到云服务器

@@ -2,15 +2,14 @@ import os
 import time
 import asyncio
 from pathlib import Path
-from openai import OpenAI
 from dotenv import load_dotenv
-from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Iterable, AsyncIterable
 from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
+from fastapi import FastAPI, HTTPException
+from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIConnectionError
 
 load_dotenv()
 app = FastAPI(docs_url=None)
@@ -39,41 +38,68 @@ def health():
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    user_input = req.message.strip()
-    resp = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role":"user","content":user_input}],
-        stream=False,
-    )
+    try:
+        user_input = req.message.strip()
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": user_input}],
+            stream=False,
+            timeout=30.0,
+        )
+    except APITimeoutError:
+        raise HTTPException(status_code=504, detail="模型服务响应超时")
+    except APIConnectionError:
+        raise HTTPException(status_code=502, detail="无法连接模型服务")
     return {"reply":resp.choices[0].message.content}
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest):
     def event_stream() -> Iterable[str]:
-        stream = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": req.message.strip()}],
-            stream=True,
-        )
-        for chunk in stream:
-            piece = chunk.choices[0].delta.content
-            if piece:
-                yield f"data: {piece}\n\n"
-    return StreamingResponse(event_stream(),media_type="text/event-stream")
+        try:
+            stream = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": req.message.strip()}],
+                stream=True,
+                timeout=30.0,
+            )
+            for chunk in stream:
+                piece = chunk.choices[0].delta.content
+                if piece:
+                    yield f"data: {piece}\n\n"
+        except APITimeoutError:
+            yield "event: upstream_error\ndata: 模型服务超时，回答已中断\n\n"
+        except APIConnectionError:
+            yield "event: upstream_error\ndata: 无法连接模型服务，回答已中断\n\n"
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.post("/chat/stream/async")
 async def chat_stream_async(req: ChatRequest):
+    """异步版 SSE 流式聊天接口。与上方同步版 chat_stream 的区别：
+    1. 使用 AsyncOpenAI（aclient）代替同步 OpenAI client，请求不阻塞事件循环；
+    2. 内部 event_stream 也是 async def，用 async for 消费 DeepSeek 返回的异步流。"""
     async def event_stream() -> AsyncIterable[str]:
-        stream = await aclient.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": req.message.strip()}],
-            stream=True,
-        )
-        async for chunk in stream:
-            piece = chunk.choices[0].delta.content
-            if piece:
-                yield f"data: {piece}\n\n"
-    return StreamingResponse(event_stream(),media_type="text/event-stream")
+        try:
+            # await 发起异步 HTTP 请求，不阻塞 FastAPI 的事件循环，
+            # 这样其它请求可以在等待 DeepSeek 响应期间被处理。
+            stream = await aclient.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": req.message.strip()}],
+                stream=True,  # 让 DeepSeek 以 SSE 逐块返回
+                timeout=30.0,
+            )
+            # async for 逐块读取异步流，每个 chunk 是 DeepSeek 推来的一个 token 增量
+            async for chunk in stream:
+                piece = chunk.choices[0].delta.content  # 取出本轮 token 文本（可能为 None）
+                if piece:  # 跳过空 token（如 role 信息、结束标记等）
+                    # SSE 协议要求：每条消息以 "data: " 开头，用两个 \n\n 与下一条分隔
+                    yield f"data: {piece}\n\n"
+        except APITimeoutError:
+            yield "event: upstream_error\ndata: 模型服务超时，回答已中断\n\n"
+        except APIConnectionError:
+            yield "event: upstream_error\ndata: 无法连接模型服务，回答已中断\n\n"
+    # StreamingResponse 接收异步生成器，FastAPI 会自动驱动它并以 chunked 编码推送给客户端，
+    # media_type 必须是 text/event-stream，浏览器/客户端才会按 SSE 协议解析。
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/slow")                      # 异步版
 async def slow():
