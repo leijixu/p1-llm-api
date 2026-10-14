@@ -66,6 +66,7 @@ def chat_stream(req: ChatRequest):
                 piece = chunk.choices[0].delta.content
                 if piece:
                     yield f"data: {piece}\n\n"
+            yield f"data: [DONE]\n\n"
         except APITimeoutError:
             yield "event: upstream_error\ndata: 模型服务超时，回答已中断\n\n"
         except APIConnectionError:
@@ -93,6 +94,7 @@ async def chat_stream_async(req: ChatRequest):
                 if piece:  # 跳过空 token（如 role 信息、结束标记等）
                     # SSE 协议要求：每条消息以 "data: " 开头，用两个 \n\n 与下一条分隔
                     yield f"data: {piece}\n\n"
+            yield f"data: [DONE]\n\n"
         except APITimeoutError:
             yield "event: upstream_error\ndata: 模型服务超时，回答已中断\n\n"
         except APIConnectionError:
