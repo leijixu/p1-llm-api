@@ -170,6 +170,40 @@ data: 模型服务超时，回答已中断
 
 - 超时：把 `timeout` 临时改成 `0.001` → `/chat` 返回 504，流式端点在流里返回 `upstream_error` 事件
 - 连不上：把 `base_url` 临时改成 `http://127.0.0.1:9/v1` → `/chat` 返回 502
+## 在线演示
+
+http://43.142.41.234:8000/docs
+
+部署在腾讯云轻量应用服务器（上海二区，Ubuntu 24.04 LTS，x86_64）。
+
+## 部署记录
+
+```bash
+# 1. 基础工具
+sudo apt update && sudo apt install -y git curl
+
+# 2. 装 uv（官方脚本从 GitHub 下载，国内可能长时间卡住；改用清华源）
+sudo pip3 install --break-system-packages -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+
+# 3. 拉代码（仓库是 public，无需配置 SSH 密钥）
+git clone https://github.com/leijixu/p1-llm-api.git && cd p1-llm-api
+
+# 4. 装依赖（uv 自动挑选并下载 CPython，依赖走 lock 文件中记录的清华源）
+uv sync
+
+# 5. 写入密钥（不要在命令行里 echo，会把 key 留在 shell 历史中）
+nano .env
+
+# 6. 启动
+uv run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+```
+
+部署时踩到的坑：
+
+- **uvicorn 默认只监听 `127.0.0.1`**，外部访问不到，必须显式加 `--host 0.0.0.0`
+- **云厂商的防火墙（安全组）默认只放行 22 端口**，需要在控制台手动放行 8000。两个坑的现象完全一样：服务在本机 curl 正常，外部全部超时
+- 国内服务器用 80 端口对公网提供 HTTP 服务需要 ICP 备案，所以演示走 8000 这类非标准端口
+- `uv sync` 的耗时主要在下载 CPython 解释器（来源是 GitHub，与依赖源无关）
 ## 已知局限与下一步
 
 - 只有超时与连接错误做了状态码映射，`APIStatusError`（上游返回错误状态码）与 `RateLimitError`（限流）还没有细分
@@ -178,4 +212,6 @@ data: 模型服务超时，回答已中断
 - 压测脚本用 `urllib`，每个请求新建 TCP 连接，客户端开销没有和端点开销分离；换成 `httpx.AsyncClient` 复用连接后能测得更准
 - 对话端点每次请求都独立，没有多轮上下文（对比：P0 的命令行版本已实现多轮记忆）
 - 尚无鉴权与限流，不适合直接暴露到公网
-- 尚未 Docker 化，也未部署到云服务器
+- 服务目前在前台运行（依赖 SSH 会话存活），尚未用 systemd 托管，也没有开机自启
+- 公网地址没有任何鉴权与限流，任何人都可以调用并消耗 API 额度
+- 尚未 Docker 化
