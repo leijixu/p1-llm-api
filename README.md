@@ -194,10 +194,39 @@ uv sync
 # 5. 写入密钥（不要在命令行里 echo，会把 key 留在 shell 历史中）
 nano .env
 
-# 6. 启动
-uv run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+# 6. 交给 systemd 托管
+#    前台启动的进程是 SSH 会话的子进程，会话一断服务就死
+sudo nano /etc/systemd/system/p1-llm-api.service
 ```
 
+unit 文件内容：
+
+```ini
+[Unit]
+Description=LLM Chat API
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/p1-llm-api
+ExecStart=/home/ubuntu/p1-llm-api/.venv/bin/uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now p1-llm-api
+sudo systemctl status p1-llm-api --no-pager
+journalctl -u p1-llm-api -f        # 持续查看日志
+```
+
+用 systemd 而不是 `nohup` / `screen`，因为它一次解决三件事：常驻、开机自启、崩溃后自动重启，而且日志统一进 `journalctl`。
+
+其中 `WorkingDirectory` 必须写对——代码里 `load_dotenv()` 是在**当前工作目录**找 `.env` 的，路径错了服务起不来，报错信息还会含糊地说是密钥缺失。
 部署时踩到的坑：
 
 - **uvicorn 默认只监听 `127.0.0.1`**，外部访问不到，必须显式加 `--host 0.0.0.0`
@@ -212,6 +241,5 @@ uv run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
 - 压测脚本用 `urllib`，每个请求新建 TCP 连接，客户端开销没有和端点开销分离；换成 `httpx.AsyncClient` 复用连接后能测得更准
 - 对话端点每次请求都独立，没有多轮上下文（对比：P0 的命令行版本已实现多轮记忆）
 - 尚无鉴权与限流，不适合直接暴露到公网
-- 服务目前在前台运行（依赖 SSH 会话存活），尚未用 systemd 托管，也没有开机自启
 - 公网地址没有任何鉴权与限流，任何人都可以调用并消耗 API 额度
 - 尚未 Docker 化
