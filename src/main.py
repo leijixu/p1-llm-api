@@ -10,6 +10,9 @@ from typing import Iterable, AsyncIterable
 from fastapi.responses import StreamingResponse
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI, AsyncOpenAI, APITimeoutError, APIConnectionError
+from collections import defaultdict, deque
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 app = FastAPI(docs_url=None)
@@ -112,3 +115,32 @@ async def slow():
 def slow_sync():
     time.sleep(1.5)
     return {"ok": 1}
+
+LIMIT = 20            # 每个 IP 每分钟最多几次
+WINDOW = 60            # 窗口长度（秒）
+GUARDED = ("/chat",)   # 只限制这些路径前缀
+
+_hits = defaultdict(deque)   # {IP: deque([该 IP 最近几次请求的时间])}
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if request.url.path.startswith(GUARDED):
+        ip = request.client.host
+        now = time.monotonic()
+        q = _hits[ip]
+
+        while q and now - q[0] > WINDOW:
+            q.popleft()
+
+        if len(q) >= LIMIT:
+            wait = int(WINDOW - (now - q[0])) + 1
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"请求过于频繁，请 {wait} 秒后再试"},
+                headers={"Retry-After": str(wait)},
+            )
+
+        q.append(now)
+
+    return await call_next(request)
+
