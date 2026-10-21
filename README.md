@@ -185,6 +185,24 @@ data: 模型服务超时，回答已中断
 - 时间用 `time.monotonic()` 而不是 `time.time()`，避免系统时间被调整时窗口错乱
 
 验证方式是先用固定延迟的对照端点 `/slow`（不消耗模型调用）在本地把 `LIMIT` 临时设成 3 跑通，再改回 20 部署上线。
+### Docker 镜像
+
+除 systemd 外，项目也提供 `Dockerfile`，用于构建可移植的镜像：
+
+```bash
+docker build -t p1-llm-api:test .
+docker run -d --name p1-test --env-file .env -p 127.0.0.1:8001:8000 p1-llm-api:test
+```
+
+两个设计点：
+
+- **`uv sync --frozen --no-install-project`**：只装依赖、不安装项目自身。本项目是要运行的服务，不是要发布的库；不加这个参数，`uv` 会以为要构建包，从而要求 `src/p1_llm_api/` 已经存在，而源码要到下一层才 COPY 进来
+- **`.env` 被 `.dockerignore` 排除**，密钥通过 `--env-file` 在运行时注入，不写进镜像层。镜像可以被随意分发，密钥只存在于运行环境里
+
+启动命令直接调用 `/app/.venv/bin/uvicorn` 而不是 `uv run`——`uv run` 默认会再同步一次项目，等于把上面那个安装问题在运行时重演一遍。
+
+当前线上 8000 端口仍由 systemd 托管；容器版在 8001 上验证通过，作为备选部署方式保留。
+
 ## 在线演示
 
 http://43.142.41.234:8000/docs
